@@ -1,0 +1,178 @@
+###############################################################################
+# CONFIGURATION
+###############################################################################
+$Config = @{
+    WatchFolder          = "D:\Watch"
+    OutputFolder         = "D:\Extracted"
+    LogFolder            = "D:\Watch\log"
+    ProcessedFolder      = "D:\Watch\processed"      # new
+    PollIntervalSeconds  = 5
+    EnableMatrixMode     = $true
+    MatrixSpeed          = 0.03
+    MatrixColumns        = 120
+    MatrixSound          = $false
+    MatrixCharacters     = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*+-=<>|"
+    SevenZip             = "C:\Program Files\7-Zip\7z.exe"
+    ArchivePassword      = ""                         # put default password here if needed, otherwise leave empty
+}
+
+# Create folders
+@($Config.WatchFolder, $Config.OutputFolder, $Config.LogFolder, $Config.ProcessedFolder) | ForEach-Object {
+    if (-not (Test-Path $_)) { New-Item -Path $_ -ItemType Directory -Force | Out-Null }
+}
+$Log = Join-Path $Config.LogFolder "extract.log"
+
+###############################################################################
+# REAL MATRIX DIGITAL RAIN (fixed + smoother)
+###############################################################################
+function Show-MatrixScreen {
+    if (-not $Config.EnableMatrixMode) { return }
+
+    $Host.UI.RawUI.BackgroundColor = "Black"
+    $Host.UI.RawUI.ForegroundColor = "Green"
+    Clear-Host
+
+    $width  = $Host.UI.RawUI.WindowSize.Width
+    $height = $Host.UI.RawUI.WindowSize.Height
+    $cols   = [Math]::Min($Config.MatrixColumns, $width)
+    $chars  = $Config.MatrixCharacters.ToCharArray()
+
+    # One drop per column: current Y position + length of tail
+    $drops = @()
+    for ($i = 0; $i -lt $cols; $i++) { $drops += @{ Pos = (Get-Random $height); Length = (Get-Random -Min 5 -Max 30) } }
+
+    if ($Config.MatrixSound) {
+        Start-Job { while ($true) { [console]::beep(800,100); Start-Sleep -Milliseconds 400 } } | Out-Null
+    }
+
+    while ($true) {
+        # Exit condition
+        if ((Get-ReadyFile)) { break }
+
+        for ($i = 0; $i -lt $cols; $i++) {
+            $drop = $drops[$i]
+            $x = $i
+            $y = $drop.Pos
+
+            # Head (bright)
+            [Console]::SetCursorPosition($x % $width, $y % $height)
+            Write-Host ($chars | Get-Random) -ForegroundColor White -NoNewline
+
+            # Tail (fading)
+            for ($j = 1; $j -lt $drop.Length; $j++) {
+                $tailY = ($y - $j) % $height
+                if ($tailY -ge0) {
+                    [Console]::SetCursorPosition($x % $width, $tailY)
+                    $brightness = 255 - ($j * 8)
+                    if ($brightness -lt 50) { $brightness = 50 }
+                    Write-Host ($chars | Get-Random) -ForegroundColor ("#{0:X2}FF{0:X2}" -f $brightness) -NoNewline
+                }
+            }
+
+            $drop.Pos += 1
+            if ($drop.Pos - $drop.Length -gt $height -and (Get-Random 20) -eq 0) {
+                $drop.Pos = 0
+                $drop.Length = Get-Random -Min 8 -Max 35
+            }
+        }
+        Start-Sleep -Milliseconds ($Config.MatrixSpeed * 1000)
+    }
+    Clear-Host
+}
+
+###############################################################################
+# Only return files that are fully written (not locked + not changing size)
+###############################################################################
+function Get-ReadyFile {
+    Get-ChildItem $Config.WatchFolder -File |
+        Where-Object { $_.Extension -notin ".tmp",".part",".crdownload" } |
+        Where-Object {
+            try {
+                # File is not locked
+                $stream = $_.Open([System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+                $stream.Close()
+                # Size stable for at least 3 seconds
+                $_.LastWriteTime -lt (Get-Date).AddSeconds(-3)
+            } catch { $false }
+        } |
+        Sort-Object LastWriteTime |
+        Select-Object -First 1
+}
+
+###############################################################################
+# Extract with REAL progress bar by parsing 7-Zip output
+###############################################################################
+function Extract-7Zip($file) {
+    $arguments = @(
+        "x"
+        "`"$($file.FullName)`""
+        "-o`"$($Config.OutputFolder)`""
+        "-y"
+    )
+    if ($Config.ArchivePassword) { $arguments += "-p`"$($Config.ArchivePassword)`"" }
+
+    Write-Host "`n[+] Extracting: $($file.Name)" -ForegroundColor Cyan
+
+    $process = Start-Process -FilePath $Config.SevenZip `
+        -ArgumentList $arguments `
+        -RedirectStandardOutput "$env:TEMP\7z_out.txt" `
+        -RedirectStandardError  "$env:TEMP\7z_err.txt" `
+        -PassThru -NoNewWindow
+
+    # Live-parse percentage
+    while (-not $process.HasExited) {
+        if (Test-Path "$env:TEMP\7z_out.txt") {
+            $line = Get-Content "$env:TEMP\7z_out.txt" -Tail 1 -ErrorAction SilentlyContinue
+            if ($line -match "(\d+)%") {
+                $percent = [int]$Matches[1]
+                Write-Progress -Activity "Extracting $($file.Name)" -Status "$percent% complete" -PercentComplete $percent
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+
+    # Final check
+    $exitCode = $process.ExitCode
+    $errorOutput = if (Test-Path "$env:TEMP\7z_err.txt") { Get-Content "$env:TEMP\7z_err.txt" -Raw } else { "" }
+
+    # Cleanup temp files
+    @("$env:TEMP\7z_out.txt", "$env:TEMP\7z_err.txt") | Where-Object { Test-Path $_ } | Remove-Item -Force
+
+    Write-Progress -Activity "Extracting $($file.Name)" -Completed
+
+    if ($exitCode -ne 0) {
+        Write-Host "[-] Extraction FAILED (code $exitCode)" -ForegroundColor Red
+        Add-Content -Path $Log -Value "$(Get-Date) ERROR `$exitCode: $($file.FullName) | $errorOutput"
+        return $false
+    }
+
+    Write-Host "[+] Extraction successful!" -ForegroundColor Green
+    Add-Content -Path $Log -Value "$(Get-Date) OK: $($file.FullName)"
+    return $true
+}
+
+###############################################################################
+# MAIN LOOP
+###############################################################################
+while ($true) {
+    $file = Get-ReadyFile
+
+    if (-not $file) {
+        Show-MatrixScreen
+        continue
+    }
+
+    Clear-Host
+    Write-Host "[+] New file ready: $($file.Name)" -ForegroundColor Yellow
+
+    if (-not (Extract-7Zip $file)) {
+        # Optional: move failed files to a separate folder
+        $failedFolder = Join-Path $Config.WatchFolder "failed"
+        if (-not (Test-Path $failedFolder)) { New-Item -ItemType Directory $failedFolder | Out-Null }
+        Move-Item $file.FullName $failedFolder -Force
+    } else {
+        Move-Item $file.FullName $Config.ProcessedFolder -Force
+    }
+
+    Start-Sleep -Seconds $Config.PollIntervalSeconds
+}
