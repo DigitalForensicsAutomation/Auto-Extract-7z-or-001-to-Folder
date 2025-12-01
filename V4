@@ -1,0 +1,153 @@
+###############################################################################
+# CONFIGURATION
+###############################################################################
+
+$Config = @{
+    WatchFolder          = "D:\Watch"
+    OutputFolder         = "D:\Extracted"
+    LogFolder            = "D:\Watch\log"
+    PollIntervalSeconds  = 5
+    EnableMatrixMode     = $true
+    MatrixSpeed          = 0.03
+    MatrixColumns        = 120
+    MatrixSound          = $false
+    MatrixCharacters     = "abcdefghijklmnopqrstuvwxyz0123456789#$%&@"
+    SevenZip             = "C:\Program Files\7-Zip\7z.exe"
+    ProgressBarColor     = "Green"
+}
+
+###############################################################################
+# Ensure folders exist
+###############################################################################
+foreach ($f in @($Config.WatchFolder, $Config.OutputFolder, $Config.LogFolder)) {
+    if (!(Test-Path $f)) { New-Item -Path $f -ItemType Directory | Out-Null }
+}
+
+$Log = Join-Path $Config.LogFolder "extract.log"
+
+###############################################################################
+# MATRIX ANIMATION (FULL SCREEN DIGITAL RAIN)
+###############################################################################
+function Show-MatrixScreen {
+    if (-not $Config.EnableMatrixMode) { return }
+
+    $width  = $Host.UI.RawUI.WindowSize.Width
+    $height = $Host.UI.RawUI.WindowSize.Height
+    $cols = $Config.MatrixColumns
+    $chars = $Config.MatrixCharacters.ToCharArray()
+
+    # Track vertical positions for each column
+    $Y = @(0) * $cols
+
+    # Optional sound
+    if ($Config.MatrixSound) {
+        Start-Job { while ($true) { [console]::beep(500,90); Start-Sleep -Milliseconds 300 } } | Out-Null
+    }
+
+    $Host.UI.RawUI.BackgroundColor = "Black"
+    $Host.UI.RawUI.ForegroundColor = "Green"
+    Clear-Host
+
+    while ($true) {
+        if (Get-NextFile) { break }
+
+        for ($i = 0; $i -lt $cols; $i++) {
+            $x = $i
+            $y = $Y[$i]
+
+            $char = $chars | Get-Random
+
+            # Draw character
+            [System.Console]::SetCursorPosition(($x % $width), ($y % $height))
+            Write-Host $char -NoNewline
+
+            # Update Y position
+            $Y[$i] = ($Y[$i] + 1)
+
+            # At random, reset a stream
+            if (Get-Random -Minimum 0 -Maximum 25 -eq 1) {
+                $Y[$i] = 0
+            }
+        }
+
+        Start-Sleep -Milliseconds ([int]($Config.MatrixSpeed * 1000))
+    }
+
+    Clear-Host
+}
+
+###############################################################################
+# FIND FILES READY FOR EXTRACTION
+###############################################################################
+function Get-NextFile {
+    Get-ChildItem $Config.WatchFolder -File |
+        Where-Object { $_.Extension -ne ".tmp" } |
+        Sort-Object LastWriteTime |
+        Select-Object -First 1
+}
+
+###############################################################################
+# EXTRACT WITH PROGRESS BAR
+###############################################################################
+function Extract-7Zip($file) {
+
+    Write-Host "`n[+] Extracting: $($file.Name)" -ForegroundColor Cyan
+    Write-Host " "
+
+    $progress = 0
+    $job = Start-Job -ScriptBlock {
+        param($Config, $file)
+        & $Config.SevenZip x "`"$($file.FullName)"`" -o"`"$($Config.OutputFolder)"`" -y
+    } -ArgumentList $Config, $file
+
+    while (-not $job.HasExited) {
+        $progress = ($progress + 2) % 100
+
+        Write-Progress `
+          -Activity "Extracting $($file.Name)" `
+          -Status "Working..." `
+          -PercentComplete $progress
+
+        Start-Sleep -Milliseconds 150
+    }
+
+    $result = Receive-Job $job
+    Remove-Job $job
+
+    Write-Progress -Activity "Done" -Completed
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[-] Extraction failed! Exit code: $LASTEXITCODE" -BackgroundColor Red -ForegroundColor White
+        Add-Content -Path $Log -Value "$(Get-Date) ERROR: Extraction failed for $file"
+        return $false
+    }
+
+    Write-Host "[+] Extract complete." -ForegroundColor Green
+    Add-Content -Path $Log -Value "$(Get-Date) OK: Extracted $file"
+
+    return $true
+}
+
+###############################################################################
+# MAIN LOOP
+###############################################################################
+while ($true) {
+
+    $file = Get-NextFile
+
+    if ($null -eq $file) {
+        Show-MatrixScreen
+        continue
+    }
+
+    Clear-Host
+    Write-Host "[+] File detected: $($file.Name)" -ForegroundColor Yellow
+    Extract-7Zip $file | Out-Null
+
+    # Move processed file to subfolder
+    $doneFolder = Join-Path $Config.WatchFolder "processed"
+    if (!(Test-Path $doneFolder)) { New-Item -ItemType Directory $doneFolder | Out-Null }
+    Move-Item $file.FullName $doneFolder -Force
+
+    Start-Sleep -Seconds $Config.PollIntervalSeconds
+}
